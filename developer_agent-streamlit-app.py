@@ -1,4 +1,5 @@
 import os
+import time
 
 import streamlit as st
 from langchain.agents import create_agent
@@ -99,6 +100,74 @@ def last_agent_message(result: dict) -> str:
     return result["messages"][-1].content
 
 
+def count_tool_calls(result: dict) -> int:
+    return sum(
+        1
+        for message in result.get("messages", [])
+        if getattr(message, "type", None) == "tool"
+        or (isinstance(message, dict) and message.get("role") == "tool")
+    )
+
+
+def coverage_summary(test_cases: str) -> str:
+    missing = [category for category in REQUIRED_COVERAGE if category not in test_cases.lower()]
+    if missing:
+        return f"Missing coverage categories: {', '.join(missing)}."
+    return "All required categories are covered: positive, negative, edge, and boundary."
+
+
+def review_context() -> str:
+    review = st.session_state.get("review_data")
+    if not review:
+        return "No review has been run yet. Ask the user to run Developer + QA Review first."
+    metrics = review["metrics"]
+    return (
+        f"Developer review:\n{review['developer_review']}\n\n"
+        f"QA test cases:\n{review['qa_review']}\n\n"
+        f"Coverage result: {coverage_summary(review['qa_review'])}\n"
+        f"Tracing enabled: {metrics['tracing_enabled']}\n"
+        f"LangSmith project: {metrics['project']}\n"
+        f"Developer duration: {metrics['developer_seconds']:.2f} seconds\n"
+        f"QA duration: {metrics['qa_seconds']:.2f} seconds\n"
+        f"Developer tool calls: {metrics['developer_tool_calls']}\n"
+        f"QA tool calls: {metrics['qa_tool_calls']}"
+    )
+
+
+def answer_chat_question(question: str, api_key: str, model_name: str) -> str:
+    lowered = question.lower()
+    review = st.session_state.get("review_data")
+    if not review:
+        return "Run Developer + QA Review first so I have test and tracing results to discuss."
+    if "coverage" in lowered or "test" in lowered:
+        return (
+            f"{coverage_summary(review['qa_review'])}\n\n"
+            f"QA Agent output:\n{review['qa_review']}"
+        )
+    if "metric" in lowered or "trace" in lowered or "langsmith" in lowered:
+        metrics = review["metrics"]
+        return (
+            "Latest run metrics:\n"
+            f"- Tracing enabled: {metrics['tracing_enabled']}\n"
+            f"- Project: {metrics['project']}\n"
+            f"- Developer duration: {metrics['developer_seconds']:.2f}s\n"
+            f"- QA duration: {metrics['qa_seconds']:.2f}s\n"
+            f"- Developer tool calls: {metrics['developer_tool_calls']}\n"
+            f"- QA tool calls: {metrics['qa_tool_calls']}\n\n"
+            "Open the LangSmith project to inspect prompts, model responses, tool inputs/outputs, tokens, cost, and nested run timing."
+        )
+
+    chat_agent = ChatOpenAI(model=model_name, api_key=api_key)
+    response = chat_agent.invoke([
+        {
+            "role": "system",
+            "content": "Answer questions about this Developer and QA review. Use only the supplied context.",
+        },
+        {"role": "user", "content": f"CONTEXT:\n{review_context()}\n\nQUESTION:\n{question}"},
+    ])
+    return response.content
+
+
 def main() -> None:
     st.set_page_config(page_title="Developer and QA Review", page_icon="review")
     st.title("Developer and QA Code Review")
@@ -106,6 +175,10 @@ def main() -> None:
         "The Developer Agent reviews the code first; the QA Agent then creates "
         "and validates test cases."
     )
+    if "review_data" not in st.session_state:
+        st.session_state.review_data = None
+    if "chat_messages" not in st.session_state:
+        st.session_state.chat_messages = []
 
     with st.sidebar:
         st.header("Model settings")
@@ -144,6 +217,7 @@ def main() -> None:
                 developer_agent = build_developer_agent(
                     openai_api_key.strip(), model_name
                 )
+                developer_started = time.perf_counter()
                 developer_result = developer_agent.invoke({
                     "messages": [{
                         "role": "user",
@@ -151,11 +225,10 @@ def main() -> None:
                     }]
                 })
                 developer_review = last_agent_message(developer_result)
-
-                st.subheader("1. Developer Agent Review")
-                st.markdown(developer_review)
+                developer_seconds = time.perf_counter() - developer_started
 
                 qa_agent = build_qa_agent(openai_api_key.strip(), model_name)
+                qa_started = time.perf_counter()
                 qa_result = qa_agent.invoke({
                     "messages": [{
                         "role": "user",
@@ -166,11 +239,66 @@ def main() -> None:
                         ),
                     }]
                 })
+                qa_seconds = time.perf_counter() - qa_started
+                project_name = langsmith_project.strip() or "developer-qa-review"
+                st.session_state.review_data = {
+                    "developer_review": developer_review,
+                    "qa_review": last_agent_message(qa_result),
+                    "metrics": {
+                        "tracing_enabled": tracing_enabled,
+                        "project": project_name,
+                        "developer_seconds": developer_seconds,
+                        "qa_seconds": qa_seconds,
+                        "developer_tool_calls": count_tool_calls(developer_result),
+                        "qa_tool_calls": count_tool_calls(qa_result),
+                    },
+                }
 
-                st.subheader("2. QA Agent Test Cases")
-                st.markdown(last_agent_message(qa_result))
             except Exception as error:
                 st.error(f"Multi-agent review failed: {error}")
+
+    review = st.session_state.get("review_data")
+    if review:
+        st.subheader("1. Developer Agent Review")
+        st.markdown(review["developer_review"])
+
+        st.subheader("2. QA Agent Test Cases")
+        st.markdown(review["qa_review"])
+
+        with st.expander("Latest run metrics"):
+            metrics = review["metrics"]
+            st.write(f"LangSmith tracing enabled: {metrics['tracing_enabled']}")
+            st.write(f"LangSmith project: {metrics['project']}")
+            st.write(f"Developer duration: {metrics['developer_seconds']:.2f} seconds")
+            st.write(f"QA duration: {metrics['qa_seconds']:.2f} seconds")
+            st.write(f"Developer tool calls: {metrics['developer_tool_calls']}")
+            st.write(f"QA tool calls: {metrics['qa_tool_calls']}")
+
+    st.divider()
+    st.subheader("Ask about this review")
+    for message in st.session_state.chat_messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    question = st.chat_input(
+        "Ask about test coverage, tracing metrics, or the review"
+    )
+    if question:
+        st.session_state.chat_messages.append({"role": "user", "content": question})
+        with st.chat_message("user"):
+            st.markdown(question)
+        with st.chat_message("assistant"):
+            try:
+                answer = answer_chat_question(
+                    question, openai_api_key.strip(), model_name
+                )
+                st.markdown(answer)
+                st.session_state.chat_messages.append({
+                    "role": "assistant",
+                    "content": answer,
+                })
+            except Exception as error:
+                st.error(f"Chat failed: {error}")
 
 
 if __name__ == "__main__":
