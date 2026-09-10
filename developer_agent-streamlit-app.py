@@ -1,10 +1,13 @@
 import os
+import re
 import time
+from typing import TypedDict
 
 import streamlit as st
 from langchain.agents import create_agent
 from langchain.tools import tool
 from langchain_openai import ChatOpenAI
+from langgraph.graph import END, START, StateGraph
 
 
 AVAILABLE_MODELS = [
@@ -14,6 +17,8 @@ AVAILABLE_MODELS = [
     "gpt-4.1",
 ]
 REQUIRED_COVERAGE = ["positive", "negative", "edge", "boundary"]
+MAX_RETRIES = 5
+RETRY_WAIT_SECONDS = 15
 
 DEFAULT_SNIPPET = """\
 def process(data):
@@ -96,6 +101,228 @@ def build_qa_agent(api_key: str, model_name: str):
     )
 
 
+class ReviewState(TypedDict, total=False):
+    code: str
+    attempt: int
+    max_attempts: int
+    developer_review: str
+    qa_review: str
+    static_result: str
+    coverage_result: str
+    passed: bool
+    reports: list[dict]
+    developer_seconds: float
+    qa_seconds: float
+    total_tool_calls: int
+    total_usage: dict
+    fixer_usage: dict
+
+
+def extract_code(response: str) -> str:
+    fenced = re.search(r"```(?:python)?\s*(.*?)```", response, re.DOTALL | re.IGNORECASE)
+    if fenced:
+        return fenced.group(1).strip()
+    return response.strip()
+
+
+def empty_usage() -> dict[str, int]:
+    return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+
+def usage_from_result(result: dict) -> dict[str, int]:
+    usage = empty_usage()
+    for message in result.get("messages", []):
+        metadata = getattr(message, "usage_metadata", None) or {}
+        if not metadata and isinstance(message, dict):
+            metadata = message.get("usage_metadata", {}) or {}
+        usage["input_tokens"] += int(
+            metadata.get("input_tokens", metadata.get("prompt_tokens", 0)) or 0
+        )
+        usage["output_tokens"] += int(
+            metadata.get("output_tokens", metadata.get("completion_tokens", 0)) or 0
+        )
+        usage["total_tokens"] += int(metadata.get("total_tokens", 0) or 0)
+    if usage["total_tokens"] == 0:
+        usage["total_tokens"] = usage["input_tokens"] + usage["output_tokens"]
+    return usage
+
+
+def usage_from_message(message) -> dict[str, int]:
+    metadata = getattr(message, "usage_metadata", None) or {}
+    usage = empty_usage()
+    usage["input_tokens"] = int(metadata.get("input_tokens", 0) or 0)
+    usage["output_tokens"] = int(metadata.get("output_tokens", 0) or 0)
+    usage["total_tokens"] = int(metadata.get("total_tokens", 0) or 0)
+    if usage["total_tokens"] == 0:
+        usage["total_tokens"] = usage["input_tokens"] + usage["output_tokens"]
+    return usage
+
+
+def add_usage(*usages: dict) -> dict[str, int]:
+    combined = empty_usage()
+    for usage in usages:
+        for key in combined:
+            combined[key] += int(usage.get(key, 0) or 0)
+    return combined
+
+
+def format_usage(usage: dict) -> str:
+    return (
+        f"Input: {usage.get('input_tokens', 0):,} | "
+        f"Output: {usage.get('output_tokens', 0):,} | "
+        f"Total: {usage.get('total_tokens', 0):,}"
+    )
+
+
+def build_review_graph(
+    api_key: str, model_name: str, max_attempts: int = MAX_RETRIES + 1
+):
+    developer_agent = build_developer_agent(api_key, model_name)
+    qa_agent = build_qa_agent(api_key, model_name)
+    fixer_llm = ChatOpenAI(model=model_name, api_key=api_key)
+
+    def review_node(state: ReviewState) -> ReviewState:
+        attempt = state.get("attempt", 0) + 1
+        code = state["code"]
+        static_result = static_code_check.invoke({"code": code})
+
+        developer_started = time.perf_counter()
+        developer_result = developer_agent.invoke({
+            "messages": [{
+                "role": "user",
+                "content": f"Review this Python code (attempt {attempt}):\n{code}",
+            }]
+        })
+        developer_seconds = time.perf_counter() - developer_started
+        developer_review = last_agent_message(developer_result)
+
+        qa_started = time.perf_counter()
+        qa_result = qa_agent.invoke({
+            "messages": [{
+                "role": "user",
+                "content": (
+                    f"Create QA test cases for attempt {attempt}.\n\n"
+                    f"CODE:\n{code}\n\n"
+                    f"DEVELOPER REVIEW:\n{developer_review}"
+                ),
+            }]
+        })
+        qa_seconds = time.perf_counter() - qa_started
+        qa_review = last_agent_message(qa_result)
+        developer_usage = usage_from_result(developer_result)
+        qa_usage = usage_from_result(qa_result)
+        fixer_usage = state.get("fixer_usage", empty_usage())
+        attempt_usage = add_usage(developer_usage, qa_usage, fixer_usage)
+        coverage_result = check_test_coverage.invoke({"test_cases_text": qa_review})
+        passed = (
+            static_result == "No obvious issues found."
+            and coverage_result == "Coverage looks complete: all required categories present."
+        )
+        report = {
+            "attempt": attempt,
+            "code": code,
+            "developer_review": developer_review,
+            "qa_review": qa_review,
+            "static_result": static_result,
+            "coverage_result": coverage_result,
+            "passed": passed,
+            "developer_seconds": developer_seconds,
+            "qa_seconds": qa_seconds,
+            "developer_usage": developer_usage,
+            "qa_usage": qa_usage,
+            "fixer_usage": fixer_usage,
+            "attempt_usage": attempt_usage,
+        }
+        return {
+            "attempt": attempt,
+            "developer_review": developer_review,
+            "qa_review": qa_review,
+            "static_result": static_result,
+            "coverage_result": coverage_result,
+            "passed": passed,
+            "reports": state.get("reports", []) + [report],
+            "developer_seconds": developer_seconds,
+            "qa_seconds": qa_seconds,
+            "total_tool_calls": state.get("total_tool_calls", 0)
+            + count_tool_calls(developer_result)
+            + count_tool_calls(qa_result),
+            "total_usage": add_usage(
+                state.get("total_usage", empty_usage()),
+                developer_usage,
+                qa_usage,
+            ),
+            "fixer_usage": empty_usage(),
+        }
+
+    def publish_node(state: ReviewState) -> ReviewState:
+        return state
+
+    def route_after_publish(state: ReviewState) -> str:
+        if state.get("passed") or state.get("attempt", 0) >= max_attempts:
+            return "finish"
+        return "fix"
+
+    def fix_node(state: ReviewState) -> ReviewState:
+        latest = state["reports"][-1]
+        response = fixer_llm.invoke([
+            {
+                "role": "system",
+                "content": (
+                    "You are a code-fixing agent. Return only the corrected Python "
+                    "code in one python code block. Fix the reported static issues "
+                    "without changing the intended behavior."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"CODE:\n{latest['code']}\n\n"
+                    f"STATIC CHECK:\n{latest['static_result']}\n\n"
+                    f"DEVELOPER REVIEW:\n{latest['developer_review']}\n\n"
+                    f"QA COVERAGE:\n{latest['coverage_result']}"
+                ),
+            },
+        ])
+        fixer_usage = usage_from_message(response)
+        return {
+            "code": extract_code(response.content),
+            "fixer_usage": fixer_usage,
+            "total_usage": add_usage(
+                state.get("total_usage", empty_usage()), fixer_usage
+            ),
+        }
+
+    def wait_node(state: ReviewState) -> ReviewState:
+        time.sleep(RETRY_WAIT_SECONDS)
+        return state
+
+    graph = StateGraph(ReviewState)
+    graph.add_node("review", review_node)
+    graph.add_node("publish", publish_node)
+    graph.add_node("fix", fix_node)
+    graph.add_node("wait", wait_node)
+    graph.add_edge(START, "review")
+    graph.add_edge("review", "publish")
+    graph.add_conditional_edges(
+        "publish", route_after_publish, {"finish": END, "fix": "fix"}
+    )
+    graph.add_edge("fix", "wait")
+    graph.add_edge("wait", "review")
+    return graph.compile()
+
+
+def run_review_graph(code: str, api_key: str, model_name: str) -> ReviewState:
+    workflow = build_review_graph(api_key, model_name)
+    return workflow.invoke({
+        "code": code,
+        "attempt": 0,
+        "max_attempts": MAX_RETRIES + 1,
+        "reports": [],
+        "total_tool_calls": 0,
+        "total_usage": empty_usage(),
+    })
+
+
 def last_agent_message(result: dict) -> str:
     return result["messages"][-1].content
 
@@ -127,10 +354,12 @@ def review_context() -> str:
         f"Coverage result: {coverage_summary(review['qa_review'])}\n"
         f"Tracing enabled: {metrics['tracing_enabled']}\n"
         f"LangSmith project: {metrics['project']}\n"
+        f"LangGraph attempts: {metrics['attempts']}\n"
+        f"Workflow passed: {metrics['passed']}\n"
         f"Developer duration: {metrics['developer_seconds']:.2f} seconds\n"
         f"QA duration: {metrics['qa_seconds']:.2f} seconds\n"
-        f"Developer tool calls: {metrics['developer_tool_calls']}\n"
-        f"QA tool calls: {metrics['qa_tool_calls']}"
+        f"Total tool calls: {metrics['total_tool_calls']}\n"
+        f"Total token usage: {format_usage(metrics['total_usage'])}"
     )
 
 
@@ -150,10 +379,12 @@ def answer_chat_question(question: str, api_key: str, model_name: str) -> str:
             "Latest run metrics:\n"
             f"- Tracing enabled: {metrics['tracing_enabled']}\n"
             f"- Project: {metrics['project']}\n"
+            f"- LangGraph attempts: {metrics['attempts']}\n"
+            f"- Workflow passed: {metrics['passed']}\n"
             f"- Developer duration: {metrics['developer_seconds']:.2f}s\n"
             f"- QA duration: {metrics['qa_seconds']:.2f}s\n"
-            f"- Developer tool calls: {metrics['developer_tool_calls']}\n"
-            f"- QA tool calls: {metrics['qa_tool_calls']}\n\n"
+            f"- Total tool calls: {metrics['total_tool_calls']}\n\n"
+            f"- Total token usage: {format_usage(metrics['total_usage'])}\n\n"
             "Open the LangSmith project to inspect prompts, model responses, tool inputs/outputs, tokens, cost, and nested run timing."
         )
 
@@ -173,7 +404,8 @@ def main() -> None:
     st.title("Developer and QA Code Review")
     st.caption(
         "The Developer Agent reviews the code first; the QA Agent then creates "
-        "and validates test cases."
+        f"and validates test cases. Failed runs are fixed and retried up to {MAX_RETRIES} "
+        f"times after a {RETRY_WAIT_SECONDS}-second wait."
     )
     if "review_data" not in st.session_state:
         st.session_state.review_data = None
@@ -195,7 +427,7 @@ def main() -> None:
 
     code = st.text_area("Python code", value=DEFAULT_SNIPPET, height=320)
 
-    if st.button("Run Developer + QA Review", type="primary", use_container_width=True):
+    if st.button("Run LangGraph Developer + QA Review", type="primary", use_container_width=True):
         if not openai_api_key.strip():
             st.error("Enter your OPENAI_API_KEY in the sidebar.")
             return
@@ -212,45 +444,28 @@ def main() -> None:
                 f"{langsmith_project.strip() or 'developer-qa-review'}"
             )
 
-        with st.spinner(f"Developer and QA agents are working with {model_name}..."):
+        with st.spinner(
+            "LangGraph is reviewing, publishing reports, and retrying failed runs..."
+        ):
             try:
-                developer_agent = build_developer_agent(
-                    openai_api_key.strip(), model_name
+                final_state = run_review_graph(
+                    code, openai_api_key.strip(), model_name
                 )
-                developer_started = time.perf_counter()
-                developer_result = developer_agent.invoke({
-                    "messages": [{
-                        "role": "user",
-                        "content": f"Review this code:\n{code}",
-                    }]
-                })
-                developer_review = last_agent_message(developer_result)
-                developer_seconds = time.perf_counter() - developer_started
-
-                qa_agent = build_qa_agent(openai_api_key.strip(), model_name)
-                qa_started = time.perf_counter()
-                qa_result = qa_agent.invoke({
-                    "messages": [{
-                        "role": "user",
-                        "content": (
-                            "Create QA test cases for this submitted code.\n\n"
-                            f"CODE:\n{code}\n\n"
-                            f"DEVELOPER REVIEW:\n{developer_review}"
-                        ),
-                    }]
-                })
-                qa_seconds = time.perf_counter() - qa_started
+                latest_report = final_state["reports"][-1]
                 project_name = langsmith_project.strip() or "developer-qa-review"
                 st.session_state.review_data = {
-                    "developer_review": developer_review,
-                    "qa_review": last_agent_message(qa_result),
+                    "developer_review": latest_report["developer_review"],
+                    "qa_review": latest_report["qa_review"],
+                    "reports": final_state["reports"],
                     "metrics": {
                         "tracing_enabled": tracing_enabled,
                         "project": project_name,
-                        "developer_seconds": developer_seconds,
-                        "qa_seconds": qa_seconds,
-                        "developer_tool_calls": count_tool_calls(developer_result),
-                        "qa_tool_calls": count_tool_calls(qa_result),
+                        "attempts": final_state["attempt"],
+                        "passed": final_state["passed"],
+                        "developer_seconds": final_state["developer_seconds"],
+                        "qa_seconds": final_state["qa_seconds"],
+                        "total_tool_calls": final_state["total_tool_calls"],
+                        "total_usage": final_state.get("total_usage", empty_usage()),
                     },
                 }
 
@@ -267,12 +482,40 @@ def main() -> None:
 
         with st.expander("Latest run metrics"):
             metrics = review["metrics"]
+            total_usage = metrics["total_usage"]
+            token_columns = st.columns(3)
+            token_columns[0].metric("Input tokens", f"{total_usage['input_tokens']:,}")
+            token_columns[1].metric("Output tokens", f"{total_usage['output_tokens']:,}")
+            token_columns[2].metric("Total tokens", f"{total_usage['total_tokens']:,}")
+            st.caption(
+                "Token cost is calculated in LangSmith using the selected model's pricing."
+            )
             st.write(f"LangSmith tracing enabled: {metrics['tracing_enabled']}")
             st.write(f"LangSmith project: {metrics['project']}")
+            st.write(f"LangGraph attempts: {metrics['attempts']}")
+            st.write(f"Workflow passed: {metrics['passed']}")
             st.write(f"Developer duration: {metrics['developer_seconds']:.2f} seconds")
             st.write(f"QA duration: {metrics['qa_seconds']:.2f} seconds")
-            st.write(f"Developer tool calls: {metrics['developer_tool_calls']}")
-            st.write(f"QA tool calls: {metrics['qa_tool_calls']}")
+            st.write(f"Total tool calls: {metrics['total_tool_calls']}")
+            st.write(f"Total token usage: {format_usage(metrics['total_usage'])}")
+
+        st.subheader("LangGraph attempt reports")
+        for report in review.get("reports", []):
+            label = "passed" if report["passed"] else "retry required"
+            with st.expander(f"Attempt {report['attempt']} - {label}"):
+                st.code(report["code"], language="python")
+                st.write(f"Static check: {report['static_result']}")
+                st.write(f"Coverage check: {report['coverage_result']}")
+                st.write(
+                    f"Developer tokens: {format_usage(report['developer_usage'])}"
+                )
+                st.write(f"QA tokens: {format_usage(report['qa_usage'])}")
+                st.write(f"Fixer tokens: {format_usage(report['fixer_usage'])}")
+                st.write(f"Attempt total: {format_usage(report['attempt_usage'])}")
+                st.markdown("**Developer report**")
+                st.markdown(report["developer_review"])
+                st.markdown("**QA report**")
+                st.markdown(report["qa_review"])
 
     st.divider()
     st.subheader("Ask about this review")
