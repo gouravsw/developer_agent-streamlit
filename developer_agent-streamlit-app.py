@@ -1,15 +1,28 @@
 import os
-import threading
-import tkinter as tk
-from tkinter import messagebox, scrolledtext, ttk
 
-from langchain_openai import ChatOpenAI
-from langchain.tools import tool
+import streamlit as st
 from langchain.agents import create_agent
+from langchain.tools import tool
+from langchain_openai import ChatOpenAI
 
-llm = ChatOpenAI(
-    model="gpt-4o-mini"
-)
+
+AVAILABLE_MODELS = [
+    "gpt-4o-mini",
+    "gpt-4o",
+    "gpt-4.1-mini",
+    "gpt-4.1",
+]
+REQUIRED_COVERAGE = ["positive", "negative", "edge", "boundary"]
+
+DEFAULT_SNIPPET = """\
+def process(data):
+    # TODO: handle empty input
+    result = []
+    for item in data:
+        result.append(item * 2)
+    return result
+"""
+
 
 @tool
 def static_code_check(code: str) -> str:
@@ -20,135 +33,144 @@ def static_code_check(code: str) -> str:
     if "TODO" in code:
         issues.append("Contains TODO comment(s) left in the code.")
     if code.count("\n") > 40:
-        issues.append("Function/file may be too long — consider splitting it.")
+        issues.append("Function/file may be too long - consider splitting it.")
     return "; ".join(issues) if issues else "No obvious issues found."
 
 
-tools = [static_code_check]
-agent = create_agent(
-    model=llm,
-    tools=tools,
-    system_prompt=(
-        "You are a senior developer performing a code review. Use "
-        "static_code_check on the snippet, then write a short, "
-        "constructive review comment covering what to fix and why."
-    ),
-    debug=True,
-)
+@tool
+def check_test_coverage(test_cases_text: str) -> str:
+    """Check test cases for positive, negative, edge, and boundary coverage."""
+    lower = test_cases_text.lower()
+    missing = [category for category in REQUIRED_COVERAGE if category not in lower]
+    if not missing:
+        return "Coverage looks complete: all required categories present."
+    return (
+        f"Missing coverage for: {', '.join(missing)}. "
+        "Please add cases for these."
+    )
 
-DEFAULT_SNIPPET = '''
-def process(data):
-    # TODO: handle empty input
-    result = []
-    for d in data:
-        result.append(d * 2)
-    return result
-'''
 
-class DeveloperReviewApp(tk.Tk):
-    def __init__(self) -> None:
-        super().__init__()
-        self.title("AI Developer Code Review")
-        self.geometry("900x700")
-        self.minsize(700, 520)
-        self._build_ui()
+def configure_langsmith(api_key: str, project_name: str) -> bool:
+    """Enable or disable LangSmith tracing for the current Streamlit process."""
+    if not api_key:
+        os.environ.pop("LANGSMITH_API_KEY", None)
+        os.environ.pop("LANGSMITH_TRACING", None)
+        os.environ.pop("LANGCHAIN_TRACING_V2", None)
+        return False
 
-    def _build_ui(self) -> None:
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(1, weight=1)
-        self.rowconfigure(3, weight=2)
+    os.environ["LANGSMITH_API_KEY"] = api_key
+    os.environ["LANGSMITH_TRACING"] = "true"
+    os.environ["LANGCHAIN_TRACING_V2"] = "true"
+    os.environ["LANGSMITH_PROJECT"] = project_name or "developer-qa-review"
+    return True
 
-        ttk.Label(
-            self,
-            text="AI Developer Code Review",
-            font=("TkDefaultFont", 16, "bold"),
-        ).grid(row=0, column=0, sticky="w", padx=12, pady=(12, 6))
 
-        input_frame = ttk.LabelFrame(self, text="Python code", padding=8)
-        input_frame.grid(row=1, column=0, sticky="nsew", padx=12, pady=6)
-        input_frame.columnconfigure(0, weight=1)
-        input_frame.rowconfigure(0, weight=1)
+@st.cache_resource(show_spinner=False)
+def build_developer_agent(api_key: str, model_name: str):
+    llm = ChatOpenAI(model=model_name, api_key=api_key)
+    return create_agent(
+        model=llm,
+        tools=[static_code_check],
+        system_prompt=(
+            "You are the Developer Agent. Review the submitted Python code. "
+            "Use static_code_check, then write a concise review with findings, "
+            "severity, and recommended fixes."
+        ),
+    )
 
-        self.code_input = scrolledtext.ScrolledText(
-            input_frame, wrap="none", undo=True, font=("Courier New", 10)
-        )
-        self.code_input.grid(row=0, column=0, sticky="nsew")
-        self.code_input.insert("1.0", DEFAULT_SNIPPET)
 
-        controls = ttk.Frame(self)
-        controls.grid(row=2, column=0, sticky="ew", padx=12, pady=6)
-        controls.columnconfigure(1, weight=1)
+@st.cache_resource(show_spinner=False)
+def build_qa_agent(api_key: str, model_name: str):
+    llm = ChatOpenAI(model=model_name, api_key=api_key)
+    return create_agent(
+        model=llm,
+        tools=[check_test_coverage],
+        system_prompt=(
+            "You are the QA Agent. The Developer Agent has already reviewed "
+            "the code. Draft concise test cases based on the code and developer "
+            "review. Label every case Positive, Negative, Edge, or Boundary. "
+            "Call check_test_coverage on your draft, then revise it if coverage "
+            "is missing. End with a brief QA recommendation."
+        ),
+    )
 
-        self.review_button = ttk.Button(
-            controls, text="Review Code", command=self._start_review
-        )
-        self.review_button.grid(row=0, column=0, padx=(0, 10))
 
-        self.status = tk.StringVar(value="Ready")
-        ttk.Label(controls, textvariable=self.status).grid(
-            row=0, column=1, sticky="w"
-        )
-
-        output_frame = ttk.LabelFrame(self, text="Review", padding=8)
-        output_frame.grid(row=3, column=0, sticky="nsew", padx=12, pady=(0, 12))
-        output_frame.columnconfigure(0, weight=1)
-        output_frame.rowconfigure(0, weight=1)
-
-        self.review_output = scrolledtext.ScrolledText(
-            output_frame, wrap="word", state="disabled", font=("TkDefaultFont", 10)
-        )
-        self.review_output.grid(row=0, column=0, sticky="nsew")
-
-    def _start_review(self) -> None:
-        code = self.code_input.get("1.0", tk.END).strip()
-        if not code:
-            messagebox.showwarning("Missing code", "Enter Python code to review.")
-            return
-        if not os.getenv("OPENAI_API_KEY"):
-            messagebox.showerror(
-                "Missing API key",
-                "Set OPENAI_API_KEY in the terminal before starting the app.",
-            )
-            return
-
-        self.review_button.config(state="disabled")
-        self.status.set("Reviewing code...")
-        self._set_output("Running static checks and asking the AI reviewer...")
-        threading.Thread(target=self._review_code, args=(code,), daemon=True).start()
-
-    def _review_code(self, code: str) -> None:
-        try:
-            result = agent.invoke({
-                "messages": [{
-                    "role": "user",
-                    "content": f"Review this code:\n{code}",
-                }]
-            })
-            review = result["messages"][-1].content
-            self.after(0, self._review_succeeded, review)
-        except Exception as error:
-            self.after(0, self._review_failed, error)
-
-    def _review_succeeded(self, review: str) -> None:
-        self._set_output(review)
-        self.status.set("Review complete")
-        self.review_button.config(state="normal")
-
-    def _review_failed(self, error: Exception) -> None:
-        self._set_output(f"Review failed:\n{error}")
-        self.status.set("Review failed")
-        self.review_button.config(state="normal")
-
-    def _set_output(self, text: str) -> None:
-        self.review_output.config(state="normal")
-        self.review_output.delete("1.0", tk.END)
-        self.review_output.insert("1.0", text)
-        self.review_output.config(state="disabled")
+def last_agent_message(result: dict) -> str:
+    return result["messages"][-1].content
 
 
 def main() -> None:
-    app = DeveloperReviewApp()
-    app.mainloop()
+    st.set_page_config(page_title="Developer and QA Review", page_icon="review")
+    st.title("Developer and QA Code Review")
+    st.caption(
+        "The Developer Agent reviews the code first; the QA Agent then creates "
+        "and validates test cases."
+    )
+
+    with st.sidebar:
+        st.header("Model settings")
+        openai_api_key = st.text_input("OPENAI_API_KEY", type="password")
+        model_name = st.selectbox("OpenAI model", AVAILABLE_MODELS)
+        st.caption("Keys are used for this session and are not written to disk by this app.")
+
+        st.header("LangSmith tracing")
+        langsmith_api_key = st.text_input("LANGSMITH_API_KEY", type="password")
+        langsmith_project = st.text_input(
+            "LangSmith project", value="developer-qa-review"
+        )
+        st.caption("Optional. When provided, both agent runs are traced in LangSmith.")
+
+    code = st.text_area("Python code", value=DEFAULT_SNIPPET, height=320)
+
+    if st.button("Run Developer + QA Review", type="primary", use_container_width=True):
+        if not openai_api_key.strip():
+            st.error("Enter your OPENAI_API_KEY in the sidebar.")
+            return
+        if not code.strip():
+            st.warning("Enter Python code to review.")
+            return
+
+        tracing_enabled = configure_langsmith(
+            langsmith_api_key.strip(), langsmith_project.strip()
+        )
+        if tracing_enabled:
+            st.info(
+                "LangSmith tracing enabled: "
+                f"{langsmith_project.strip() or 'developer-qa-review'}"
+            )
+
+        with st.spinner(f"Developer and QA agents are working with {model_name}..."):
+            try:
+                developer_agent = build_developer_agent(
+                    openai_api_key.strip(), model_name
+                )
+                developer_result = developer_agent.invoke({
+                    "messages": [{
+                        "role": "user",
+                        "content": f"Review this code:\n{code}",
+                    }]
+                })
+                developer_review = last_agent_message(developer_result)
+
+                st.subheader("1. Developer Agent Review")
+                st.markdown(developer_review)
+
+                qa_agent = build_qa_agent(openai_api_key.strip(), model_name)
+                qa_result = qa_agent.invoke({
+                    "messages": [{
+                        "role": "user",
+                        "content": (
+                            "Create QA test cases for this submitted code.\n\n"
+                            f"CODE:\n{code}\n\n"
+                            f"DEVELOPER REVIEW:\n{developer_review}"
+                        ),
+                    }]
+                })
+
+                st.subheader("2. QA Agent Test Cases")
+                st.markdown(last_agent_message(qa_result))
+            except Exception as error:
+                st.error(f"Multi-agent review failed: {error}")
 
 
 if __name__ == "__main__":
